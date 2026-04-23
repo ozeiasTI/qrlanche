@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, TextInput, Button, StyleSheet, Alert, FlatList, Platform } from 'react-native';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { View, Text, TextInput, Button, StyleSheet, Alert, FlatList, Platform, ScrollView } from 'react-native';
 import { NavigationContainer, useFocusEffect } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { CameraView, useCameraPermissions } from 'expo-camera';
@@ -16,40 +16,32 @@ const Stack = createNativeStackNavigator();
 let db;
 
 async function initDatabase(setReady) {
-  db = await SQLite.openDatabaseAsync('leitor.db');
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS registros (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sessao TEXT,
-      codigo TEXT,
-      datahora TEXT
-    );
-    CREATE TABLE IF NOT EXISTS alunos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      matricula TEXT UNIQUE NOT NULL,
-      nome TEXT,
-      curso TEXT
-    );
-  `);
-  setReady(true);
+  try {
+    db = await SQLite.openDatabaseAsync('leitor.db');
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS registros (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sessao TEXT,
+        codigo TEXT,
+        datahora TEXT
+      );
+      CREATE TABLE IF NOT EXISTS alunos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        matricula TEXT UNIQUE NOT NULL,
+        nome TEXT,
+        curso TEXT
+      );
+    `);
+    setReady(true);
+  } catch (err) {
+    console.error('Erro ao inicializar banco de dados:', err);
+    Alert.alert('Erro', 'Falha ao inicializar o banco de dados. Reinicie o app.');
+  }
 }
 
 // 🏠 Tela inicial
 function HomeScreen({ navigation }) {
   const [sessionName, setSessionName] = useState('');
-  const [dbReady, setDbReady] = useState(false);
-
-  useEffect(() => {
-    initDatabase(setDbReady);
-  }, []);
-
-  if (!dbReady) {
-    return (
-      <View style={styles.container}>
-        <Text>Inicializando banco de dados...</Text>
-      </View>
-    );
-  }
 
   const clearDatabase = async () => {
     Alert.alert(
@@ -94,6 +86,9 @@ function HomeScreen({ navigation }) {
         <Button title="Gerenciar Alunos" onPress={() => navigation.navigate('ManageStudents')} />
       </View>
       <View style={{ marginTop: 20 }}>
+        <Button title="Central de Leituras" onPress={() => navigation.navigate('ReadingCenter')} />
+      </View>
+      <View style={{ marginTop: 20 }}>
         <Button title="Como usar o app" onPress={() => navigation.navigate('Help')} />
       </View>
       <View style={{ marginTop: 120 }}>
@@ -111,8 +106,11 @@ function ScannerScreen({ route, navigation }) {
   const { sessionName } = route.params;
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
-  const [feedback, setFeedback] = useState({ message: '', color: '' });
+  const [isCoolingDown, setIsCoolingDown] = useState(false);
+  const [feedback, setFeedback] = useState({ message: '', color: '', textColor: '#fff' });
   const [count, setCount] = useState(0);
+  const cooldownTimerRef = useRef(null);
+  const COOLDOWN_MS = 3000;
 
   const loadCount = async () => {
     try {
@@ -128,6 +126,12 @@ function ScannerScreen({ route, navigation }) {
 
   useEffect(() => {
     loadCount();
+
+    return () => {
+      if (cooldownTimerRef.current) {
+        clearTimeout(cooldownTimerRef.current);
+      }
+    };
   }, []);
 
   if (!permission) return <View />;
@@ -141,6 +145,8 @@ function ScannerScreen({ route, navigation }) {
   }
 
   const handleBarCodeScanned = async ({ data }) => {
+    if (scanned || isCoolingDown) return;
+
     setScanned(true);
 
     try {
@@ -150,7 +156,7 @@ function ScannerScreen({ route, navigation }) {
       );
 
       if (!aluno) {
-        setFeedback({ message: `não cadastrado!`, color: '#FF5555' });
+        setFeedback({ message: `não cadastrado!`, color: '#FF5555', textColor: '#fff' });
         Alert.alert('Erro', `Matrícula '${data}' não encontrada no cadastro.`);
       } else {
         const duplicados = await db.getAllAsync(
@@ -159,26 +165,31 @@ function ScannerScreen({ route, navigation }) {
         );
 
         if (duplicados.length > 0) {
-          setFeedback({ message: `⚠️ Já pegou`, color: '#990000' });
+          setFeedback({ message: `⚠️ Já pegou`, color: '#990000', textColor: '#fff' });
         } else {
           await db.runAsync(
             'INSERT INTO registros (sessao, codigo, datahora) VALUES (?, ?, datetime("now", "localtime"));',
             [sessionName, data]
           );
-          setFeedback({ message: `✅ registrado com sucesso!`, color: '#4CAF50' });
+          setFeedback({ message: 'Aguarde', color: '#FFD400', textColor: '#1F1F1F' });
+          setIsCoolingDown(true);
           loadCount();
         }
       }
     } catch (err) {
       console.error('Erro ao salvar leitura ou verificar matrícula:', err);
-      setFeedback({ message: '⚠️ Ocorreu um erro ao registrar!', color: '#FF5555' });
+      setFeedback({ message: '⚠️ Ocorreu um erro ao registrar!', color: '#FF5555', textColor: '#fff' });
     }
 
-    // limpa feedback após 3s
-    setTimeout(() => {
-      setFeedback({ message: '', color: '' });
+    // evita leituras em sequência e remove o feedback após cooldown
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+    }
+    cooldownTimerRef.current = setTimeout(() => {
+      setFeedback({ message: '', color: '', textColor: '#fff' });
       setScanned(false);
-    }, 3000);
+      setIsCoolingDown(false);
+    }, COOLDOWN_MS);
   };
 
   return (
@@ -186,17 +197,23 @@ function ScannerScreen({ route, navigation }) {
       {/* Feedback textual visível */}
       {feedback.message !== '' && (
         <View style={[styles.feedbackTop, { backgroundColor: feedback.color }]}>
-          <Text style={styles.feedbackText}>{feedback.message}</Text>
+          <Text style={[styles.feedbackText, { color: feedback.textColor }]}>{feedback.message}</Text>
         </View>
       )}
 
       {/* Área da câmera */}
       <View style={styles.cameraBox}>
         <CameraView
+          active={!isCoolingDown}
           onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
           style={styles.cameraView}
         />
+        {isCoolingDown && (
+          <View style={styles.cameraMask}>
+            <Text style={styles.cameraMaskText}>Aguarde</Text>
+          </View>
+        )}
       </View>
 
       {/* Rodapé com sessão e contador */}
@@ -359,6 +376,213 @@ function HistoryScreen() {
         />
       )}
     </View>
+  );
+}
+
+function MiniBarChart({ title, data, color = '#1E88E5' }) {
+  const maxValue = data.length > 0 ? Math.max(...data.map((item) => item.value)) : 1;
+
+  return (
+    <View style={styles.chartContainer}>
+      <Text style={styles.chartTitle}>{title}</Text>
+      {data.length === 0 ? (
+        <Text style={styles.emptyChartText}>Sem dados para exibir.</Text>
+      ) : (
+        data.map((item) => {
+          const percentage = maxValue === 0 ? 0 : Math.round((item.value / maxValue) * 100);
+          return (
+            <View key={item.label} style={styles.chartRow}>
+              <Text style={styles.chartLabel}>{item.label}</Text>
+              <View style={styles.chartTrack}>
+                <View style={[styles.chartBar, { width: `${percentage}%`, backgroundColor: color }]} />
+              </View>
+              <Text style={styles.chartValue}>{item.value}</Text>
+            </View>
+          );
+        })
+      )}
+    </View>
+  );
+}
+
+function ReadingCenterScreen() {
+  const [students, setStudents] = useState([]);
+  const [selectedStudent, setSelectedStudent] = useState('');
+  const [summary, setSummary] = useState({ total: 0, firstRead: null, lastRead: null, nome: '' });
+  const [hourData, setHourData] = useState([]);
+  const [sessionData, setSessionData] = useState([]);
+  const [recentReads, setRecentReads] = useState([]);
+
+  const loadStudentsWithReads = useCallback(async () => {
+    try {
+      const result = await db.getAllAsync(
+        `SELECT
+          r.codigo AS matricula,
+          COALESCE(a.nome, 'Aluno não cadastrado') AS nome,
+          COUNT(r.id) AS total
+        FROM registros r
+        LEFT JOIN alunos a ON a.matricula = r.codigo
+        GROUP BY r.codigo
+        ORDER BY total DESC, nome ASC;`
+      );
+
+      setStudents(result);
+
+      if (result.length === 0) {
+        setSelectedStudent('');
+        return;
+      }
+
+      setSelectedStudent((current) => {
+        const exists = result.some((s) => s.matricula === current);
+        return exists ? current : result[0].matricula;
+      });
+    } catch (err) {
+      console.error('Erro ao carregar alunos com leituras:', err);
+      Alert.alert('Erro', 'Não foi possível carregar a Central de Leituras.');
+    }
+  }, []);
+
+  const loadStudentAnalytics = useCallback(async (matricula) => {
+    if (!matricula) return;
+
+    try {
+      const studentInfo = students.find((s) => s.matricula === matricula);
+      const totalRows = await db.getAllAsync(
+        `SELECT
+          COUNT(*) AS total,
+          MIN(datahora) AS firstRead,
+          MAX(datahora) AS lastRead
+        FROM registros
+        WHERE codigo = ?;`,
+        [matricula]
+      );
+
+      const byHour = await db.getAllAsync(
+        `SELECT
+          substr(datahora, 12, 2) AS hour,
+          COUNT(*) AS total
+        FROM registros
+        WHERE codigo = ?
+        GROUP BY hour
+        ORDER BY hour ASC;`,
+        [matricula]
+      );
+
+      const bySession = await db.getAllAsync(
+        `SELECT
+          sessao,
+          COUNT(*) AS total
+        FROM registros
+        WHERE codigo = ?
+        GROUP BY sessao
+        ORDER BY total DESC, sessao ASC;`,
+        [matricula]
+      );
+
+      const latestReads = await db.getAllAsync(
+        `SELECT
+          sessao,
+          datahora
+        FROM registros
+        WHERE codigo = ?
+        ORDER BY id DESC
+        LIMIT 20;`,
+        [matricula]
+      );
+
+      setSummary({
+        total: totalRows[0]?.total ?? 0,
+        firstRead: totalRows[0]?.firstRead ?? null,
+        lastRead: totalRows[0]?.lastRead ?? null,
+        nome: studentInfo?.nome ?? 'Aluno',
+      });
+
+      setHourData(
+        byHour.map((item) => ({
+          label: `${item.hour}h`,
+          value: Number(item.total),
+        }))
+      );
+
+      setSessionData(
+        bySession.map((item) => ({
+          label: item.sessao,
+          value: Number(item.total),
+        }))
+      );
+
+      setRecentReads(latestReads);
+    } catch (err) {
+      console.error('Erro ao carregar análises do aluno:', err);
+      Alert.alert('Erro', 'Não foi possível carregar os gráficos do aluno.');
+    }
+  }, [students]);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadStudentsWithReads();
+    }, [loadStudentsWithReads])
+  );
+
+  useEffect(() => {
+    if (selectedStudent) {
+      loadStudentAnalytics(selectedStudent);
+    }
+  }, [selectedStudent, loadStudentAnalytics]);
+
+  return (
+    <ScrollView contentContainerStyle={styles.readingCenterContainer}>
+      <Text style={styles.title}>📊 Central de Leituras</Text>
+
+      {students.length === 0 ? (
+        <Text style={{ textAlign: 'center', marginTop: 20 }}>Nenhuma leitura encontrada para analisar.</Text>
+      ) : (
+        <>
+          <View style={styles.filterContainer}>
+            <Text style={styles.filterLabel}>Selecione o aluno:</Text>
+            <Picker
+              selectedValue={selectedStudent}
+              style={styles.picker}
+              onValueChange={(itemValue) => setSelectedStudent(itemValue)}
+            >
+              {students.map((s) => (
+                <Picker.Item
+                  key={s.matricula}
+                  label={`${s.nome} (${s.matricula}) - ${s.total} leituras`}
+                  value={s.matricula}
+                />
+              ))}
+            </Picker>
+          </View>
+
+          <View style={styles.summaryCard}>
+            <Text style={styles.summaryTitle}>{summary.nome}</Text>
+            <Text style={styles.summaryText}>Matrícula: {selectedStudent}</Text>
+            <Text style={styles.summaryText}>Total de leituras: {summary.total}</Text>
+            <Text style={styles.summaryText}>Primeira leitura: {summary.firstRead || '-'}</Text>
+            <Text style={styles.summaryText}>Última leitura: {summary.lastRead || '-'}</Text>
+          </View>
+
+          <MiniBarChart title="Leituras por horário" data={hourData} color="#F9A825" />
+          <MiniBarChart title="Leituras por sessão" data={sessionData} color="#2E7D32" />
+
+          <View style={styles.chartContainer}>
+            <Text style={styles.chartTitle}>Horários recentes</Text>
+            {recentReads.length === 0 ? (
+              <Text style={styles.emptyChartText}>Sem registros recentes.</Text>
+            ) : (
+              recentReads.map((item, index) => (
+                <View key={`${item.datahora}-${index}`} style={styles.recentItem}>
+                  <Text style={styles.recentSession}>{item.sessao}</Text>
+                  <Text style={styles.recentTime}>{item.datahora}</Text>
+                </View>
+              ))
+            )}
+          </View>
+        </>
+      )}
+    </ScrollView>
   );
 }
 
@@ -545,12 +769,27 @@ function HelpScreen() {
 
 // 🚀 App principal
 export default function App() {
+  const [dbReady, setDbReady] = useState(false);
+
+  useEffect(() => {
+    initDatabase(setDbReady);
+  }, []);
+
+  if (!dbReady) {
+    return (
+      <View style={styles.container}>
+        <Text>Inicializando banco de dados...</Text>
+      </View>
+    );
+  }
+
   return (
     <NavigationContainer>
       <Stack.Navigator>
         <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'QR Lanche' }} />
         <Stack.Screen name="Scanner" component={ScannerScreen} options={{ title: 'Leitura' }} />
         <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Histórico' }} />
+        <Stack.Screen name="ReadingCenter" component={ReadingCenterScreen} options={{ title: 'Central de Leituras' }} />
         <Stack.Screen name="ManageStudents" component={ManageStudentsScreen} options={{ title: 'Gerenciar Alunos' }} />
         <Stack.Screen name="Help" component={HelpScreen} options={{ title: 'Como usar o app' }} />
       </Stack.Navigator>
@@ -566,7 +805,6 @@ const styles = StyleSheet.create({
   overlay: { position: 'absolute', bottom: 40, left: 20, right: 20, backgroundColor: '#00000099', padding: 15, borderRadius: 10, alignItems: 'center' },
   sessionTitle: { color: '#fff', fontSize: 30, marginBottom: 10 },
   feedbackBox: { padding: 20, borderRadius: 10, marginBottom: 15 },
-  feedbackText: { fontSize: 22, color: '#fff', textAlign: 'center', fontWeight: 'bold' },
   title: { fontSize: 20, textAlign: 'center', marginBottom: 20, fontWeight: 'bold' },
   filterContainer: { marginBottom: 10 },
   filterLabel: { fontSize: 14, marginBottom: 5 },
@@ -612,15 +850,112 @@ const styles = StyleSheet.create({
   feedbackText: {
     fontSize: 40,
     fontWeight: 'bold',
-    color: '#fff',
     textAlign: 'center',
-    transform: [{ rotate: '180deg' }]
+    transform: [{ rotate: '180deg' }],
+  },
+  cameraMask: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cameraMaskText: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#FFD400',
   },
   helpText: {
   fontSize: 16,
   marginBottom: 10,
   color: '#333',
   lineHeight: 22,
-},
+  },
+  readingCenterContainer: {
+    padding: 20,
+    backgroundColor: '#f2f2f2',
+    paddingBottom: 40,
+  },
+  summaryCard: {
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 12,
+    borderLeftWidth: 5,
+    borderLeftColor: '#1E88E5',
+  },
+  summaryTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 8,
+    color: '#222',
+  },
+  summaryText: {
+    fontSize: 14,
+    color: '#333',
+    marginBottom: 4,
+  },
+  chartContainer: {
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+  },
+  chartTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    color: '#222',
+  },
+  chartRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  chartLabel: {
+    width: 72,
+    fontSize: 12,
+    color: '#444',
+  },
+  chartTrack: {
+    flex: 1,
+    height: 12,
+    backgroundColor: '#E5E7EB',
+    borderRadius: 999,
+    overflow: 'hidden',
+  },
+  chartBar: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  chartValue: {
+    width: 35,
+    textAlign: 'right',
+    marginLeft: 8,
+    fontSize: 12,
+    color: '#222',
+    fontWeight: 'bold',
+  },
+  emptyChartText: {
+    color: '#666',
+    fontStyle: 'italic',
+  },
+  recentItem: {
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ECECEC',
+  },
+  recentSession: {
+    fontSize: 13,
+    color: '#333',
+    fontWeight: 'bold',
+  },
+  recentTime: {
+    fontSize: 12,
+    color: '#555',
+  },
 
 });
